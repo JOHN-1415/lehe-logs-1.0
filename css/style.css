@@ -478,6 +478,12 @@ input:focus {
   border-left: 4px solid var(--danger);
 }
 
+.breakdown-table tr.summary-row {
+  border-left: 4px solid var(--text-dim);
+  opacity: 0.75;
+  font-style: italic;
+}
+
 /* Summar Cards */
 .summary-card {
   background: var(--glass);

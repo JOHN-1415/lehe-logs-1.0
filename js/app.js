@@ -246,7 +246,7 @@ async function renderHouseDetail(houseId, push = true) {
 
       <h3>Monthly Rent Breakdown</h3>
       <div style="margin-bottom: 2rem;">
-        ${house.isRunning ? '<p class="hint-text">Breakdown not available for running rentals.</p>' : renderMonthlyBreakdown(house)}
+        ${renderMonthlyBreakdown(house)}
       </div>
 
       ${!house.isRunning ? `<p class="running-month">Running Month: ${getRunningMonthLabel()} (rent not yet due)</p>` : ''}
@@ -352,12 +352,33 @@ async function saveLog(e, houseId) {
 
 
 function calculateHouseBalance(house) {
-  // Running-rental: balance pre-set at registration, just adjust for logs
   if (house.isRunning) {
+    // Running-rental: start with the pre-set balance at registration,
+    // then add one month's rent for every cycle that has started using
+    // the original houseTakenDate's day-of-month as the recurring due date.
+    const entryDate = house.entryDate || house.houseTakenDate;
+    const firstRentDate = getFirstRentDateAfterEntry(house.houseTakenDate, entryDate);
+    // Use local date parts (not toISOString) to avoid UTC timezone shift
+    const frd = firstRentDate;
+    const firstRentDateStr = `${frd.getFullYear()}-${String(frd.getMonth() + 1).padStart(2, "0")}-${String(frd.getDate()).padStart(2, "0")}`;
+    const monthlyCyclesAfterEntry = getCompletedRentCycleList(firstRentDateStr);
+
+    let totalRentDue = house.startingBalance;
+    const rentHistory = house.rentHistory || [];
+
+    for (const cycle of monthlyCyclesAfterEntry) {
+      const cycleStart = new Date(cycle.cycleStartDate);
+      let effectiveRent = house.monthlyRent;
+      for (const h of rentHistory) {
+        if (new Date(h.from) <= cycleStart) effectiveRent = h.amount;
+      }
+      totalRentDue += effectiveRent;
+    }
+
     const totalPaid = house.logs.reduce((sum, log) => sum + log.amount, 0);
-    const rawBalance = Math.max(0, house.startingBalance - totalPaid);
-    house.rentBalance = rawBalance;
-    house.remainingAdvance = house.remainingAdvance ?? house.advanceAmount;
+    const rentBalance = Math.max(0, totalRentDue - totalPaid);
+    house.rentBalance = rentBalance;
+    house.remainingAdvance = Math.max(0, house.advanceAmount - rentBalance);
     return;
   }
 
@@ -583,15 +604,41 @@ function applyPaymentsToMonths(months, monthlyRent, logs) {
 
 
 function renderMonthlyBreakdown(house) {
-  let cycles = getCompletedRentCycleList(house.houseTakenDate);
+  // For running rentals, track breakdown from the first rent due date
+  // that falls on/after entryDate using the original houseTakenDate's day.
+  let breakdownStartDate;
+  if (house.isRunning) {
+    const entryDate = house.entryDate || house.houseTakenDate;
+    const firstRentDate = getFirstRentDateAfterEntry(house.houseTakenDate, entryDate);
+    // Use local date parts to avoid UTC timezone shift
+    const frd = firstRentDate;
+    breakdownStartDate = `${frd.getFullYear()}-${String(frd.getMonth() + 1).padStart(2, "0")}-${String(frd.getDate()).padStart(2, "0")}`;
+  } else {
+    breakdownStartDate = house.houseTakenDate;
+  }
+
+  let cycles = getCompletedRentCycleList(breakdownStartDate);
   cycles = applyPaymentsToMonths(
     cycles,
     house.monthlyRent,
     house.logs
   );
 
+  // For running rentals, prepend a summary row for the pre-existing balance
+  const preExistingRows = house.isRunning && house.startingBalance > 0
+    ? `<tr class="summary-row">
+        <td colspan="2"><em>Pre-existing balance</em></td>
+        <td>₹${house.startingBalance}</td>
+        <td>—</td>
+      </tr>`
+    : "";
+
+  if (cycles.length === 0 && !preExistingRows) {
+    return `<p class="no-logs">No rent cycles tracked yet</p>`;
+  }
+
   if (cycles.length === 0) {
-    return `<p class="no-logs">No completed rent cycles yet</p>`;
+    return `<table class="breakdown-table"><thead><tr><th>Cycle</th><th>Rent</th><th>Paid</th><th>Status</th></tr></thead><tbody>${preExistingRows}</tbody></table>`;
   }
 
   return `
@@ -605,6 +652,7 @@ function renderMonthlyBreakdown(house) {
         </tr>
       </thead>
       <tbody>
+        ${preExistingRows}
         ${cycles.map(c => {
     let status = "Due";
     if (c.paid >= c.rent) status = "Paid";
@@ -671,6 +719,27 @@ function getCompletedRentCycles(startDate, today = new Date()) {
   return count;
 }
 
+/**
+ * For running rentals: find the first date on/after entryDate
+ * that falls on the same day-of-month as houseTakenDate.
+ * e.g. houseTakenDate=05-02-2025, entryDate=04-03-2026 → returns 05-03-2026
+ *      houseTakenDate=02-02-2025, entryDate=04-03-2026 → returns 02-04-2026
+ *      houseTakenDate=02-02-2025, entryDate=03-03-2026 → returns 02-03-2026
+ */
+function getFirstRentDateAfterEntry(houseTakenDate, entryDate) {
+  const rentDay = new Date(houseTakenDate).getDate(); // e.g. 5
+  const entry = new Date(entryDate);
+
+  // Try the rent day in the same month as entry
+  const sameMonth = new Date(entry.getFullYear(), entry.getMonth(), rentDay);
+  if (sameMonth >= entry) {
+    return sameMonth;
+  }
+
+  // Otherwise push to next month
+  return new Date(entry.getFullYear(), entry.getMonth() + 1, rentDay);
+}
+
 function getCompletedRentCycleList(startDate, today = new Date()) {
   const cycles = [];
   const start = new Date(startDate);
@@ -679,10 +748,11 @@ function getCompletedRentCycleList(startDate, today = new Date()) {
   let index = 0;
 
   while (true) {
-    const nextCycle = new Date(cycleStart);
-    nextCycle.setMonth(nextCycle.getMonth() + 1);
+    // A rent cycle is due as soon as its start date has arrived
+    if (today >= cycleStart) {
+      const nextCycle = new Date(cycleStart);
+      nextCycle.setMonth(nextCycle.getMonth() + 1);
 
-    if (today >= nextCycle) {
       cycles.push({
         index: ++index,
         label: `${formatDateDMY(cycleStart)} – ${formatDateDMY(nextCycle)}`,
@@ -706,6 +776,7 @@ function formatDateDMY(dateStr) {
   const year = d.getFullYear();
   return `${day}/${month}/${year}`;
 }
+
 
 async function exportHousePDF(houseId) {
   const { jsPDF } = window.jspdf;
@@ -927,18 +998,19 @@ async function restoreBackupData(backup) {
 }
 
 function getHouseStatus(house) {
-  // No due at all
+  // No balance at all → green
   if (house.rentBalance === 0) {
-    return "settled"; // green
+    return "settled";
   }
 
-  // Advance can still cover at least one more month
-  if (house.remainingAdvance >= house.monthlyRent) {
-    return "covered"; // yellow
+  // Advance still fully covers the outstanding balance → yellow
+  // (advance >= balance means no real cash needed yet)
+  if (house.advanceAmount >= house.rentBalance) {
+    return "covered";
   }
 
-  // Advance exhausted
-  return "due"; // red
+  // Balance exceeds advance → red (cash is owed)
+  return "due";
 }
 
 
@@ -1710,8 +1782,9 @@ function bindAddHouseEvents() {
       monthlyRent: Number(runForm[2].value),
       advanceAmount: Number(runForm[3].value),   // remaining advance
       remainingAdvance: Number(runForm[3].value),
-      startingBalance: Number(runForm[4].value), // existing rent due
+      startingBalance: Number(runForm[4].value), // existing rent due at entry
       houseTakenDate: runForm[5].value,
+      entryDate: new Date().toISOString().split("T")[0], // date added to app
       isRunning: true,
       rentHistory: [],
       logs: []
